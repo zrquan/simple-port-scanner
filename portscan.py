@@ -1,30 +1,61 @@
 import argparse
 import asyncio
 import socket
-from collections import defaultdict
 from ipaddress import ip_network, ip_address, AddressValueError
 from typing import Iterator
 
-from rich.progress import Progress
-from rich.tree import Tree
-from rich import print
+from rich.console import Console
 
 
 class Scanner():
     def __init__(self, args) -> None:
-        self.targets = tuple(self._parse_targets(args.target))
-        self.ports = tuple(self._parse_ports(args.port))
         self.timeout = args.timeout
         self.verbose = args.verbose
-        self.result = defaultdict(dict)
+        self.tasks = asyncio.Queue(1000)
+        self.todo = 0  # 未完成扫描的端口数
+        self.out = Console()
 
-        asyncio.run(self.ready())
+        with self.out.status(f"[magenta]Starting...") as status:
+            self.status = status
+            loop = asyncio.get_event_loop()
+            t = asyncio.ensure_future(self.start(args.target, args.port))
+            loop.run_until_complete(t)
 
-        if len(self.result) > 0:
-            self.handler.report(self.result)
+    def _task_done(self):
+        self.todo -= 1
+        self.tasks.task_done()
+        self.status.update(f"[magenta]Tasks queue: {self.todo}")
 
-    async def _check_port(self, target: str, port: int):
-        state = service = 'unknown'
+    async def grab_banner(self, target, port):
+        service = 'unknown'
+        try:
+            service = socket.getservbyport(port)
+        except OSError as why:
+            if self.verbose:
+                self.out.log(why)
+
+        if service.startswith('http'):
+            message = 'GET / HTTP/1.1\r\n\r\n'
+            reader, writer = await asyncio.open_connection(target, port)
+            writer.write(message.encode())
+            await writer.drain()
+
+            data = await reader.read()
+            self.out.print(
+                f'[green]{target}:{port}[/green] -- [cyan]{service}')
+            self.out.print(f'[blue]{data.decode()}')
+
+            writer.close()
+            await writer.wait_closed()
+        else:
+            self.out.print(
+                f'[green]{target}:{port}[/green] -- [cyan]{service}')
+
+        self._task_done()
+
+    async def check_port(self):
+        target, port = await self.tasks.get()
+        state = 'closed'
         try:
             await asyncio.wait_for(
                 asyncio.open_connection(target, port),
@@ -39,13 +70,12 @@ class Scanner():
             }
             state = reason[why.__class__.__name__]
 
-        try:
-            service = socket.getservbyport(port)
-        except OSError:
-            pass
-
-        self.result[target].update({port: (state, service)})
-        self.handler.log(target, port, state, self.verbose)
+        if state == 'open':
+            asyncio.ensure_future(self.grab_banner(target, port))
+        else:
+            if self.verbose and state != 'timeout':
+                self.out.print(f'[red]{target}:{port} => {state}')
+            self._task_done()
 
     def _parse_ports(self, port_arg) -> Iterator[int]:
         for port in port_arg.split(','):
@@ -73,42 +103,15 @@ class Scanner():
             except AddressValueError:
                 raise SystemExit(f'Invalid IP address: {target}')
 
-    async def ready(self):
-        tasks = [self._check_port(target, port)
-                 for target in self.targets
-                 for port in self.ports]
-        self.handler = ResultHandler(len(tasks))
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self.handler.finish()
+    async def start(self, ip_arg, port_arg):
+        for target in self._parse_targets(ip_arg):
+            for port in self._parse_ports(port_arg):
+                await self.tasks.put((target, port))
+                asyncio.ensure_future(self.check_port())
+                self.todo += 1
+                self.status.update(f"[magenta]Tasks queue: {self.todo}")
 
-
-class ResultHandler():
-    def __init__(self, port_num: int) -> None:
-        prog = Progress()
-        prog.start()
-        self.task = prog.add_task('Scanning...', total=port_num)
-        self.console = prog.console
-        self.prog = prog
-
-    def log(self, target: str, port: int, state: str, verbose: bool):
-        if verbose:
-            if state == 'open':
-                self.console.print(
-                    f'port [green]{port}[/green] open on [green]{target}[/green]')
-        self.prog.update(self.task, advance=1)
-
-    def report(self, result: dict):
-        report = Tree('[bold red]Result')
-        for target, port_info in result.items():
-            target_report = report.add(target)
-            for port, state in port_info.items():
-                if state[0] == 'open':
-                    target_report.add(
-                        f'[blue]{port} - {state[0]} - {state[1]}')
-        print(report)
-
-    def finish(self):
-        self.prog.stop()
+        await self.tasks.join()
 
 
 if __name__ == '__main__':
@@ -118,7 +121,8 @@ if __name__ == '__main__':
     parser.add_argument('target', help='target ip(s)')
     parser.add_argument(
         '-p', '--port', help='target ports, separated by comma')
-    parser.add_argument('-t', '--timeout', type=int, default=5)
+    parser.add_argument('-t', '--timeout', type=int, default=5,
+                        help='connection timeout, default is 5s')
     parser.add_argument('-v', '--verbose', action='store_true')
 
     arguments = parser.parse_args()
