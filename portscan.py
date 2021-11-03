@@ -6,6 +6,9 @@ from typing import Iterator
 
 from rich.console import Console
 
+from aiohttp import ClientSession
+from lxml.html import fromstring
+
 
 class Scanner():
     def __init__(self, args) -> None:
@@ -34,19 +37,21 @@ class Scanner():
             if self.verbose:
                 self.out.log(why)
 
-        if service.startswith('http'):
-            message = 'GET / HTTP/1.1\r\n\r\n'
-            reader, writer = await asyncio.open_connection(target, port)
-            writer.write(message.encode())
-            await writer.drain()
-
-            data = await reader.read()
-            self.out.print(
-                f'[green]{target}:{port}[/green] -- [cyan]{service}')
-            self.out.print(f'[blue]{data.decode()}')
-
-            writer.close()
-            await writer.wait_closed()
+        if 'http' in service:
+            async with ClientSession() as session:
+                async with session.get(f'http://{target}:{port}', ssl=False) as resp:
+                    self.out.print(
+                        f'[green]{target}:{port}[/green] -- [cyan]{service}')
+                    if resp.headers["X-Powered-By"]:
+                        self.out.print(
+                            f'[blue]X-Powered-By: {resp.headers["X-Powered-By"]}')
+                    if resp.headers["Server"]:
+                        self.out.print(
+                            f'[blue]Server: {resp.headers["Server"]}')
+                    content = await resp.text()
+                    if content is not None:
+                        title = fromstring(content).findtext('.//title')
+                        self.out.print(f'[blue]Title: {title}')
         else:
             self.out.print(
                 f'[green]{target}:{port}[/green] -- [cyan]{service}')
